@@ -6,13 +6,15 @@ from loguru import logger
 from joblib import load, dump
 from urllib.parse import quote
 from binascii import unhexlify
-from typing import Literal, Union, Dict
+from rapidfuzz import process, distance
+from typing import Literal, Union, Dict, List
+from concurrent.futures import ProcessPoolExecutor, wait
 from Crypto.Util.number import bytes_to_long, long_to_bytes
 
 
 class Engine:
 
-    sig_list: list = []
+    sig_list: List[Dict] = []
 
     def __init__(self, bin_path: str, feature_db_root_path: str,
                  platform: Literal["OpenBMC", "MegaRAC", "UEFI", "Debian", "Ubuntu", "Android"],
@@ -78,13 +80,59 @@ class Engine4Query(Engine):
             self.db_in_memory = {}
         else:
             self.db_in_memory = deepcopy(db_in_memory)
+        self.pool = ProcessPoolExecutor(max_workers=8)
 
     def query_sig(self):
         self.gen_sig()
         self.update_db_in_memory()
+        tasks = []
+        for idx in range(len(self.sig_list)):
+            task = self.pool.submit(self.query_sig_by_func, idx, True)
+            tasks.append(task)
+        wait(tasks)
+        for task in tasks:
+            result = task.result()
+            for idx in result.keys():
+                for filepath in result[idx].keys():
+                    for sig in result[idx][filepath]:
+                        if "hit" not in self.sig_list[idx].keys():
+                            self.sig_list[idx]["hit"] = dict()
+                        if filepath not in self.sig_list[idx]["hit"].keys():
+                            self.sig_list[idx]["hit"][filepath] = []
+                        self.sig_list[idx]["hit"][filepath].append(sig)
 
-    def query_sig_by_func(self, func: Dict):
-        return
+    def query_sig_by_func(self, idx: int, async_call=False):
+        results = {}
+        func = self.sig_list[idx]
+        for filepath in self.db_in_memory.keys():
+            filtered_sig_list = []
+            for sig in self.db_in_memory[filepath]:
+                if func["graph"]["nbbs"] -2 <= sig["graph"]["nbbs"] <= func["graph"]["nbbs"] + 2:
+                    filtered_sig_list.append(sig)
+            fuzzy_list = [sig["fuzzy"] for sig in filtered_sig_list]
+            hit_fuzzy_list = process.extractOne(func["fuzzy"],
+                                                choices=fuzzy_list,
+                                                scorer=distance.Levenshtein.distance,
+                                                # scorer_kwargs={"weights": (1, 1, 2)},
+                                                score_cutoff=func["graph"]["nbbs"] * 2
+                                                )
+            for hit in hit_fuzzy_list:
+                idx = hit[2]
+                sig = filtered_sig_list[idx]
+                if not async_call:
+                    if "hit" not in self.sig_list[idx].keys():
+                        self.sig_list[idx]["hit"] = dict()
+                    if filepath not in self.sig_list[idx]["hit"].keys():
+                        self.sig_list[idx]["hit"][filepath] = []
+                    self.sig_list[idx]["hit"][filepath].append(sig)
+                else:
+                    if idx not in results.keys():
+                        results[idx] = dict()
+                    if filepath not in results[idx].keys():
+                        results[idx][filepath] = []
+                    results[idx][filepath].append(sig)
+        if async_call:
+            return results
 
     def update_db_in_memory(self):
         for root, _, filename_list in os.walk(self.feature_db_platform_path):
